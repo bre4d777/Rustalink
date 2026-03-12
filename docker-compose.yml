@@ -1,8 +1,8 @@
 services:
-rustalink:
-  build: .
-  volumes:
-    - ./config.toml:/config.toml:ro
-  ports:
-    - "2333:2333"
-  restart: unless-stopped
+  rustalink:
+    build: .
+    volumes:
+      - ./config.toml:/config.toml:ro
+    ports:
+      - "2333:2333"
+    restart: unless-stopped
