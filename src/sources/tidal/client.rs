@@ -1,81 +1,71 @@
+// Copyright (c) 2026 appujet, notdeltaxd and contributors
+// Licensed under the Apache License, Version 2.0
+
 use std::sync::Arc;
 
 use serde_json::Value;
+use tracing::debug;
 
-use super::{
-    error::{TidalError, TidalResult},
-    token::TidalTokenTracker,
-};
+use super::error::{TidalError, TidalResult};
 
-const API_BASE: &str = "https://api.tidal.com/v1";
-
-pub struct TidalClient {
+pub struct HifiClient {
     pub inner: Arc<reqwest::Client>,
-    pub token_tracker: Arc<TidalTokenTracker>,
+    pub base_urls: Vec<String>,
+    pub quality_order: Vec<String>,
     pub country_code: String,
-    pub quality: String,
 }
 
-impl TidalClient {
+impl HifiClient {
     pub fn new(
         inner: Arc<reqwest::Client>,
-        token_tracker: Arc<TidalTokenTracker>,
+        mut base_urls: Vec<String>,
+        quality_order: Vec<String>,
         country_code: String,
-        quality: String,
-    ) -> Self {
-        Self {
-            inner,
-            token_tracker,
-            country_code,
-            quality,
+    ) -> Result<Self, String> {
+        if base_urls.is_empty() {
+            return Err(
+                "hifi_apis must contain at least one HiFi API URL (e.g. http://localhost:8000)"
+                    .to_string(),
+            );
         }
-    }
-
-    pub fn base_request(&self, builder: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
-        builder
-            .header(
-                reqwest::header::USER_AGENT,
-                "TIDAL/3704 CFNetwork/1220.1 Darwin/20.3.0",
-            )
-            .header("Accept-Language", "en-US")
-    }
-
-    pub async fn get_json(&self, path: &str) -> TidalResult<Value> {
-        let url = if path.starts_with("http") {
-            path.to_owned()
-        } else {
-            format!("{API_BASE}{path}")
-        };
-
-        // Append country code if not present
-        let url = if !url.contains("countryCode=") {
-            if url.contains('?') {
-                format!("{url}&countryCode={}", self.country_code)
-            } else {
-                format!("{url}?countryCode={}", self.country_code)
+        if quality_order.is_empty() {
+            return Err("hifi_qualities must not be empty".to_string());
+        }
+        for url in &mut base_urls {
+            while url.ends_with('/') {
+                url.pop();
             }
-        } else {
-            url
-        };
+        }
+        Ok(Self { inner, base_urls, quality_order, country_code })
+    }
 
-        let mut req = self.base_request(self.inner.get(&url));
+    pub async fn get(&self, path: &str, params: &[(&str, &str)]) -> TidalResult<Value> {
+        let mut last_err = TidalError::AllApisFailed;
 
-        if let Some(t) = self.token_tracker.get_scraper_token().await {
-            req = req.header("x-tidal-token", t);
-        } else if let Some(t) = self.token_tracker.get_oauth_token().await {
-            req = req.header("Authorization", format!("Bearer {t}"));
-        } else {
-            return Err(TidalError::NoToken);
+        for base_url in &self.base_urls {
+            let url = format!("{}{}", base_url, path);
+            debug!("HiFi: GET {} params={:?}", url, params);
+
+            let resp = match self.inner.get(&url).query(params).send().await {
+                Ok(r) => r,
+                Err(e) => {
+                    debug!("HiFi: {} unreachable — {}", base_url, e);
+                    last_err = TidalError::Request(e);
+                    continue;
+                }
+            };
+
+            if !resp.status().is_success() {
+                let status = resp.status();
+                let body = resp.text().await.unwrap_or_default();
+                debug!("HiFi: {} → {} — {}", url, status, &body);
+                last_err = TidalError::ApiError { status, body };
+                continue;
+            }
+
+            return resp.json::<Value>().await.map_err(TidalError::Request);
         }
 
-        let resp = req.send().await?;
-
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let body = resp.text().await.unwrap_or_default();
-            return Err(TidalError::ApiError { status, body });
-        }
-
-        Ok(resp.json().await?)
+        Err(last_err)
     }
 }

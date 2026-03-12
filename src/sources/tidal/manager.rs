@@ -1,15 +1,5 @@
 // Copyright (c) 2026 appujet, notdeltaxd and contributors
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// Licensed under the Apache License, Version 2.0
 
 use std::sync::{Arc, OnceLock};
 
@@ -20,10 +10,8 @@ use serde_json::Value;
 use tracing::{debug, warn};
 
 use super::{
-    client::TidalClient,
-    model::{Manifest, PlaybackInfo},
-    oauth::TidalOAuth,
-    token::TidalTokenTracker,
+    client::HifiClient,
+    model::{Manifest, PlaybackData},
     track::TidalTrack,
 };
 use crate::{
@@ -39,8 +27,31 @@ fn url_regex() -> &'static Regex {
     })
 }
 
+fn default_quality_order() -> Vec<String> {
+    vec!["LOSSLESS".to_string(), "HIGH".to_string(), "LOW".to_string()]
+}
+
+fn audio_format(url: &str, mime_type: Option<&str>, quality: &str) -> AudioFormat {
+    if let Some(m) = mime_type {
+        if m.contains("flac") {
+            return AudioFormat::Flac;
+        }
+        if m.contains("mp4") || m.contains("aac") {
+            return AudioFormat::Mp4;
+        }
+    }
+    let by_url = AudioFormat::from_url(url);
+    if by_url != AudioFormat::Unknown {
+        return by_url;
+    }
+    match quality {
+        "HI_RES_LOSSLESS" | "HI_RES" | "LOSSLESS" => AudioFormat::Flac,
+        _ => AudioFormat::Aac,
+    }
+}
+
 pub struct TidalSource {
-    pub client: Arc<TidalClient>,
+    pub client: Arc<HifiClient>,
     playlist_load_limit: usize,
     album_load_limit: usize,
     artist_load_limit: usize,
@@ -51,47 +62,19 @@ impl TidalSource {
         config: Option<crate::config::TidalConfig>,
         http_client: Arc<reqwest::Client>,
     ) -> Result<Self, String> {
-        let (country, quality, p_limit, a_limit, art_limit, refresh_token, get_oauth_token) =
+        let (country, quality_order, hifi_apis, p_limit, a_limit, art_limit) =
             if let Some(c) = config {
-                (
-                    c.country_code,
-                    c.quality,
-                    c.playlist_load_limit,
-                    c.album_load_limit,
-                    c.artist_load_limit,
-                    c.refresh_token,
-                    c.get_oauth_token,
-                )
+                let quality_order = if c.hifi_qualities.is_empty() {
+                    default_quality_order()
+                } else {
+                    c.hifi_qualities
+                };
+                (c.country_code, quality_order, c.hifi_apis, c.playlist_load_limit, c.album_load_limit, c.artist_load_limit)
             } else {
-                (
-                    "US".to_string(),
-                    crate::config::sources::default_tidal_quality(),
-                    0,
-                    0,
-                    0,
-                    None,
-                    false,
-                )
+                ("US".to_string(), default_quality_order(), vec![], 0, 0, 0)
             };
 
-        let oauth = Arc::new(TidalOAuth::new(refresh_token));
-
-        if get_oauth_token {
-            let oauth_clone = oauth.clone();
-            tokio::spawn(async move {
-                oauth_clone.initialize_access_token().await;
-            });
-        }
-
-        let token_tracker = Arc::new(TidalTokenTracker::new(http_client.clone(), oauth));
-        token_tracker.clone().init();
-
-        let client = Arc::new(TidalClient::new(
-            http_client,
-            token_tracker,
-            country,
-            quality,
-        ));
+        let client = Arc::new(HifiClient::new(http_client, hifi_apis, quality_order, country)?);
 
         Ok(Self {
             client,
@@ -109,18 +92,26 @@ impl TidalSource {
             .unwrap_or("Unknown Title")
             .to_string();
 
-        let artists = item
+        let author = item
             .get("artists")
             .and_then(|v| v.as_array())
+            .filter(|a| !a.is_empty())
             .map(|a| {
                 a.iter()
                     .filter_map(|x| x.get("name").and_then(|n| n.as_str()))
                     .collect::<Vec<_>>()
                     .join(", ")
             })
+            .or_else(|| {
+                item.get("artist")
+                    .and_then(|a| a.get("name"))
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_owned())
+            })
             .unwrap_or_else(|| "Unknown Artist".to_owned());
 
         let length = item.get("duration").and_then(|v| v.as_u64()).unwrap_or(0) * 1000;
+
         let isrc = item
             .get("isrc")
             .and_then(|v| v.as_str())
@@ -135,11 +126,11 @@ impl TidalSource {
             .map(|s| {
                 format!(
                     "https://resources.tidal.com/images/{}/1280x1280.jpg",
-                    s.replace("-", "/")
+                    s.replace('-', "/")
                 )
             });
 
-        let url = item
+        let uri = item
             .get("url")
             .and_then(|v| v.as_str())
             .filter(|s| !s.is_empty())
@@ -147,11 +138,11 @@ impl TidalSource {
 
         Some(TrackInfo {
             title,
-            author: artists,
+            author,
             length,
             identifier: id,
             is_stream: false,
-            uri: url,
+            uri,
             artwork_url,
             isrc,
             source_name: "tidal".to_owned(),
@@ -161,227 +152,173 @@ impl TidalSource {
     }
 
     async fn get_track_data(&self, id: &str) -> LoadResult {
-        match self.client.get_json(&format!("/tracks/{id}")).await {
-            Ok(data) => self
-                .parse_track(&data)
+        match self.client.get("/info/", &[("id", id)]).await {
+            Ok(data) => data
+                .get("data")
+                .and_then(|d| self.parse_track(d))
                 .map(|i| LoadResult::Track(Track::new(i)))
                 .unwrap_or(LoadResult::Empty {}),
             Err(_) => LoadResult::Empty {},
         }
     }
 
-    async fn get_album_or_playlist(&self, id: &str, type_str: &str) -> LoadResult {
-        let info_data = match self.client.get_json(&format!("/{type_str}s/{id}")).await {
+    async fn get_album(&self, id: &str) -> LoadResult {
+        let limit = self.album_load_limit.clamp(1, 500).to_string();
+        let data = match self.client.get("/album/", &[("id", id), ("limit", &limit)]).await {
             Ok(d) => d,
             Err(_) => return LoadResult::Empty {},
         };
 
-        let title = info_data
+        let album = match data.get("data") {
+            Some(d) => d,
+            None => return LoadResult::Empty {},
+        };
+
+        let title = album
             .get("title")
             .and_then(|v| v.as_str())
             .unwrap_or("Unknown")
             .to_owned();
-        let limit = (if type_str == "album" {
-            self.album_load_limit
-        } else {
-            self.playlist_load_limit
-        })
-        .clamp(1, 100);
 
-        let tracks_data = match self
-            .client
-            .get_json(&format!("/{type_str}s/{id}/tracks?limit={limit}"))
-            .await
-        {
-            Ok(d) => d,
-            Err(_) => return LoadResult::Empty {},
-        };
-
-        let mut tracks = Vec::new();
-        if let Some(items) = tracks_data.get("items").and_then(|v| v.as_array()) {
-            for item in items {
-                let track_obj = item.get("item").unwrap_or(item);
-                if let Some(info) = self.parse_track(track_obj) {
-                    tracks.push(Track::new(info));
-                }
-            }
-        }
+        let tracks: Vec<Track> = album
+            .get("items")
+            .and_then(|v| v.as_array())
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(|w| self.parse_track(w.get("item").unwrap_or(w)))
+                    .map(Track::new)
+                    .collect()
+            })
+            .unwrap_or_default();
 
         if tracks.is_empty() {
             return LoadResult::Empty {};
         }
 
         LoadResult::Playlist(PlaylistData {
-            info: PlaylistInfo {
-                name: title,
-                selected_track: -1,
-            },
+            info: PlaylistInfo { name: title, selected_track: -1 },
             plugin_info: serde_json::json!({
-                "type": type_str,
-                "url": format!("https://tidal.com/browse/{type_str}/{id}"),
-                "totalTracks": info_data.get("numberOfTracks").or_else(|| info_data.get("numberOfSongs")).and_then(|v| v.as_u64()).unwrap_or(tracks.len() as u64)
+                "type": "album",
+                "url": format!("https://tidal.com/browse/album/{id}"),
+                "totalTracks": album.get("numberOfTracks").and_then(|v| v.as_u64()).unwrap_or(tracks.len() as u64)
+            }),
+            tracks,
+        })
+    }
+
+    async fn get_playlist(&self, id: &str) -> LoadResult {
+        let limit = self.playlist_load_limit.clamp(1, 500).to_string();
+        let data = match self.client.get("/playlist/", &[("id", id), ("limit", &limit)]).await {
+            Ok(d) => d,
+            Err(_) => return LoadResult::Empty {},
+        };
+
+        let title = data
+            .get("playlist")
+            .and_then(|p| p.get("title"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("Unknown")
+            .to_owned();
+
+        let tracks: Vec<Track> = data
+            .get("items")
+            .and_then(|v| v.as_array())
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(|w| self.parse_track(w.get("item").unwrap_or(w)))
+                    .map(Track::new)
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        if tracks.is_empty() {
+            return LoadResult::Empty {};
+        }
+
+        LoadResult::Playlist(PlaylistData {
+            info: PlaylistInfo { name: title, selected_track: -1 },
+            plugin_info: serde_json::json!({
+                "type": "playlist",
+                "url": format!("https://tidal.com/browse/playlist/{id}"),
+                "totalTracks": tracks.len()
             }),
             tracks,
         })
     }
 
     async fn get_mix(&self, id: &str, name_override: Option<String>) -> LoadResult {
-        let data = match self
-            .client
-            .get_json(&format!("/mixes/{id}/items?limit=100"))
-            .await
-        {
+        let data = match self.client.get("/mix/", &[("id", id)]).await {
             Ok(d) => d,
             Err(_) => return LoadResult::Empty {},
         };
 
-        let mut tracks = Vec::new();
-        if let Some(items) = data.get("items").and_then(|v| v.as_array()) {
-            for item in items {
-                let track_obj = item.get("item").unwrap_or(item);
-                if let Some(info) = self.parse_track(track_obj) {
-                    tracks.push(Track::new(info));
-                }
-            }
-        }
+        let title = name_override.unwrap_or_else(|| {
+            data.get("mix")
+                .and_then(|m| m.get("title"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("Mix")
+                .to_owned()
+        });
+
+        let tracks: Vec<Track> = data
+            .get("items")
+            .and_then(|v| v.as_array())
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(|item| self.parse_track(item))
+                    .map(Track::new)
+                    .collect()
+            })
+            .unwrap_or_default();
 
         if tracks.is_empty() {
             return LoadResult::Empty {};
         }
 
         LoadResult::Playlist(PlaylistData {
-            info: PlaylistInfo {
-                name: name_override.unwrap_or_else(|| format!("Mix: {id}")),
-                selected_track: -1,
-            },
-            plugin_info: serde_json::json!({ "type": "playlist", "url": format!("https://tidal.com/browse/mix/{id}"), "totalTracks": tracks.len() }),
+            info: PlaylistInfo { name: title, selected_track: -1 },
+            plugin_info: serde_json::json!({
+                "type": "mix",
+                "url": format!("https://tidal.com/browse/mix/{id}"),
+                "totalTracks": tracks.len()
+            }),
             tracks,
         })
     }
 
-    async fn resolve_by_isrc(&self, isrc: &str) -> LoadResult {
-        // v2 only; requires OAuth Bearer. scraper token won't work here.
-        let token = match self.client.token_tracker.get_oauth_token().await {
-            Some(t) => t,
-            None => {
-                warn!("Tidal ISRC lookup requires an OAuth token; none configured");
-                return LoadResult::Empty {};
-            }
-        };
-
-        let url = format!(
-            "https://openapi.tidal.com/v2/tracks?countryCode={}",
-            self.client.country_code
-        );
-
-        let resp = self
-            .client
-            .base_request(self.client.inner.get(&url))
-            .query(&[("filter[isrc]", isrc)])
-            .header("Authorization", format!("Bearer {token}"))
-            .send()
-            .await;
-
-        let r = match resp {
-            Ok(r) => r,
-            Err(e) => {
-                debug!("Tidal ISRC request failed: {e}");
-                return LoadResult::Empty {};
-            }
-        };
-
-        if !r.status().is_success() {
-            debug!(
-                "Tidal ISRC response {}: {}",
-                r.status(),
-                r.text().await.unwrap_or_default()
-            );
-            return LoadResult::Empty {};
-        }
-
-        let data: serde_json::Value = match r.json().await {
-            Ok(d) => d,
-            Err(e) => {
-                debug!("Tidal ISRC response parse error: {e}");
-                return LoadResult::Empty {};
-            }
-        };
-
-        match data.pointer("/data/0/id").and_then(|v| v.as_str()) {
-            Some(id) => self.get_track_data(id).await,
-            None => {
-                debug!("Tidal ISRC={isrc} not found in catalog");
-                LoadResult::Empty {}
-            }
-        }
-    }
-
-    async fn search(&self, query: &str) -> LoadResult {
-        let encoded = urlencoding::encode(query);
-        match self
-            .client
-            .get_json(&format!("/search?query={encoded}&limit=10&types=TRACKS"))
-            .await
-        {
-            Ok(data) => {
-                let mut tracks = Vec::new();
-                if let Some(items) = data.pointer("/tracks/items").and_then(|v| v.as_array()) {
-                    for item in items {
-                        if let Some(info) = self.parse_track(item) {
-                            tracks.push(Track::new(info));
-                        }
-                    }
-                }
-                if tracks.is_empty() {
-                    LoadResult::Empty {}
-                } else {
-                    LoadResult::Search(tracks)
-                }
-            }
-            Err(_) => LoadResult::Empty {},
-        }
-    }
-
-    async fn get_recommendations(&self, id: &str) -> LoadResult {
-        if let Ok(data) = self.client.get_json(&format!("/tracks/{id}")).await
-            && let Some(mix_id) = data.pointer("/mixes/TRACK_MIX").and_then(|v| v.as_str())
-        {
-            return self
-                .get_mix(mix_id, Some("Tidal Recommendations".to_string()))
-                .await;
-        }
-        LoadResult::Empty {}
-    }
-
-    async fn get_artist_top_tracks(&self, id: &str) -> LoadResult {
-        let info_data = match self.client.get_json(&format!("/artists/{id}")).await {
+    async fn get_artist(&self, id: &str) -> LoadResult {
+        let info = match self.client.get("/artist/", &[("id", id)]).await {
             Ok(d) => d,
             Err(_) => return LoadResult::Empty {},
         };
 
-        let name = info_data
-            .get("name")
+        let name = info
+            .get("artist")
+            .and_then(|a| a.get("name"))
             .and_then(|v| v.as_str())
-            .unwrap_or("Unknown Artist");
-        let limit = self.artist_load_limit.clamp(1, 10);
+            .unwrap_or("Unknown Artist")
+            .to_owned();
 
-        let data = match self
-            .client
-            .get_json(&format!("/artists/{id}/toptracks?limit={limit}"))
-            .await
-        {
+        let limit = self.artist_load_limit.clamp(1, 50).to_string();
+        let data = match self.client.get("/artist/", &[("f", id), ("limit", &limit)]).await {
             Ok(d) => d,
             Err(_) => return LoadResult::Empty {},
         };
 
-        let mut tracks = Vec::new();
-        if let Some(items) = data.get("items").and_then(|v| v.as_array()) {
-            for item in items {
-                if let Some(info) = self.parse_track(item) {
-                    tracks.push(Track::new(info));
-                }
-            }
-        }
+        let tracks: Vec<Track> = data
+            .get("tracks")
+            .and_then(|v| v.as_array())
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(|item| self.parse_track(item))
+                    .map(Track::new)
+                    .collect()
+            })
+            .unwrap_or_default();
 
         if tracks.is_empty() {
             return LoadResult::Empty {};
@@ -392,9 +329,162 @@ impl TidalSource {
                 name: format!("{name}'s Top Tracks"),
                 selected_track: -1,
             },
-            plugin_info: serde_json::json!({ "type": "artist", "url": format!("https://tidal.com/browse/artist/{id}"), "totalTracks": tracks.len() }),
+            plugin_info: serde_json::json!({
+                "type": "artist",
+                "url": format!("https://tidal.com/browse/artist/{id}"),
+                "totalTracks": tracks.len()
+            }),
             tracks,
         })
+    }
+
+    async fn search(&self, query: &str) -> LoadResult {
+        match self.client.get("/search/", &[("s", query), ("limit", "10")]).await {
+            Ok(data) => {
+                let tracks: Vec<Track> = data
+                    .get("data")
+                    .and_then(|d| d.get("items"))
+                    .and_then(|v| v.as_array())
+                    .map(|items| {
+                        items
+                            .iter()
+                            .filter_map(|item| self.parse_track(item))
+                            .map(Track::new)
+                            .collect()
+                    })
+                    .unwrap_or_default();
+
+                if tracks.is_empty() {
+                    LoadResult::Empty {}
+                } else {
+                    LoadResult::Search(tracks)
+                }
+            }
+            Err(_) => LoadResult::Empty {},
+        }
+    }
+
+    async fn resolve_by_isrc(&self, isrc: &str) -> LoadResult {
+        match self.client.get("/search/", &[("isrc", isrc), ("limit", "5")]).await {
+            Ok(data) => {
+                let items = match data
+                    .get("data")
+                    .and_then(|d| d.get("items"))
+                    .and_then(|v| v.as_array())
+                {
+                    Some(i) => i,
+                    None => return LoadResult::Empty {},
+                };
+
+                let item = items
+                    .iter()
+                    .find(|t| {
+                        t.get("isrc")
+                            .and_then(|v| v.as_str())
+                            .map(|i| i.eq_ignore_ascii_case(isrc))
+                            .unwrap_or(false)
+                    })
+                    .or_else(|| items.first());
+
+                item.and_then(|i| self.parse_track(i))
+                    .map(|i| LoadResult::Track(Track::new(i)))
+                    .unwrap_or(LoadResult::Empty {})
+            }
+            Err(_) => LoadResult::Empty {},
+        }
+    }
+
+    async fn get_recommendations(&self, id: &str) -> LoadResult {
+        match self.client.get("/recommendations/", &[("id", id)]).await {
+            Ok(data) => {
+                let tracks: Vec<Track> = data
+                    .get("data")
+                    .and_then(|d| d.get("items"))
+                    .and_then(|v| v.as_array())
+                    .map(|items| {
+                        items
+                            .iter()
+                            .filter_map(|item| {
+                                self.parse_track(item.get("track").unwrap_or(item))
+                            })
+                            .map(Track::new)
+                            .collect()
+                    })
+                    .unwrap_or_default();
+
+                if tracks.is_empty() {
+                    LoadResult::Empty {}
+                } else {
+                    LoadResult::Playlist(PlaylistData {
+                        info: PlaylistInfo {
+                            name: "Tidal Recommendations".to_owned(),
+                            selected_track: -1,
+                        },
+                        plugin_info: serde_json::json!({ "type": "recommendations", "totalTracks": tracks.len() }),
+                        tracks,
+                    })
+                }
+            }
+            Err(_) => LoadResult::Empty {},
+        }
+    }
+
+    async fn resolve_stream_url(&self, track_id: &str) -> Option<(String, AudioFormat)> {
+        for quality in &self.client.quality_order {
+            let result = self
+                .client
+                .get("/track/", &[("id", track_id), ("quality", quality.as_str())])
+                .await;
+
+            let raw = match result {
+                Ok(r) => r,
+                Err(e) => {
+                    debug!("HiFi /track/ id={} quality={} failed: {}", track_id, quality, e);
+                    continue;
+                }
+            };
+
+            let playback: PlaybackData = match raw
+                .get("data")
+                .and_then(|d| serde_json::from_value(d.clone()).ok())
+            {
+                Some(p) => p,
+                None => continue,
+            };
+
+            if playback.manifest_mime_type == "application/dash+xml" {
+                debug!("HiFi /track/ id={} quality={}: skipping DASH", track_id, quality);
+                continue;
+            }
+
+            let decoded = match general_purpose::STANDARD.decode(&playback.manifest) {
+                Ok(d) => d,
+                Err(e) => {
+                    warn!("HiFi /track/ id={} quality={}: base64 decode failed: {}", track_id, quality, e);
+                    continue;
+                }
+            };
+
+            let manifest: Manifest = match serde_json::from_slice(&decoded) {
+                Ok(m) => m,
+                Err(e) => {
+                    debug!("HiFi /track/ id={} quality={}: manifest parse failed: {}", track_id, quality, e);
+                    continue;
+                }
+            };
+
+            let stream_url = match manifest.urls.into_iter().next() {
+                Some(u) => u,
+                None => continue,
+            };
+
+            let fmt = audio_format(&stream_url, manifest.mime_type.as_deref(), quality);
+            debug!("HiFi /track/ id={} quality={} → {:?}", track_id, quality, fmt);
+            return Some((stream_url, fmt));
+        }
+
+        warn!("HiFi: all qualities exhausted for track {}", track_id);
+        None
     }
 }
 
@@ -405,17 +495,9 @@ impl SourcePlugin for TidalSource {
     }
 
     fn can_handle(&self, identifier: &str) -> bool {
-        self.search_prefixes()
-            .iter()
-            .any(|p| identifier.starts_with(p))
-            || self
-                .isrc_prefixes()
-                .iter()
-                .any(|p| identifier.starts_with(p))
-            || self
-                .rec_prefixes()
-                .iter()
-                .any(|p| identifier.starts_with(p))
+        self.search_prefixes().iter().any(|p| identifier.starts_with(p))
+            || self.isrc_prefixes().iter().any(|p| identifier.starts_with(p))
+            || self.rec_prefixes().iter().any(|p| identifier.starts_with(p))
             || url_regex().is_match(identifier)
     }
 
@@ -437,27 +519,15 @@ impl SourcePlugin for TidalSource {
         identifier: &str,
         _: Option<Arc<dyn crate::routeplanner::RoutePlanner>>,
     ) -> LoadResult {
-        if let Some(prefix) = self
-            .search_prefixes()
-            .iter()
-            .find(|p| identifier.starts_with(**p))
-        {
+        if let Some(prefix) = self.search_prefixes().iter().find(|p| identifier.starts_with(**p)) {
             return self.search(&identifier[prefix.len()..]).await;
         }
 
-        if let Some(prefix) = self
-            .isrc_prefixes()
-            .iter()
-            .find(|p| identifier.starts_with(**p))
-        {
+        if let Some(prefix) = self.isrc_prefixes().iter().find(|p| identifier.starts_with(**p)) {
             return self.resolve_by_isrc(&identifier[prefix.len()..]).await;
         }
 
-        if let Some(prefix) = self
-            .rec_prefixes()
-            .iter()
-            .find(|p| identifier.starts_with(**p))
-        {
+        if let Some(prefix) = self.rec_prefixes().iter().find(|p| identifier.starts_with(**p)) {
             return self.get_recommendations(&identifier[prefix.len()..]).await;
         }
 
@@ -467,9 +537,10 @@ impl SourcePlugin for TidalSource {
 
             return match type_str {
                 "track" => self.get_track_data(id).await,
-                "album" | "playlist" => self.get_album_or_playlist(id, type_str).await,
+                "album" => self.get_album(id).await,
+                "playlist" => self.get_playlist(id).await,
                 "mix" => self.get_mix(id, None).await,
-                "artist" => self.get_artist_top_tracks(id).await,
+                "artist" => self.get_artist(id).await,
                 _ => LoadResult::Empty {},
             };
         }
@@ -483,103 +554,21 @@ impl SourcePlugin for TidalSource {
         _: Option<Arc<dyn crate::routeplanner::RoutePlanner>>,
     ) -> Option<crate::sources::plugin::BoxedTrack> {
         let id = if let Some(caps) = url_regex().captures(identifier) {
-            let type_str = caps.get(1).map_or("", |m| m.as_str());
-            let id = caps.get(2).map_or("", |m| m.as_str());
-            if type_str != "track" {
+            if caps.get(1).map_or("", |m| m.as_str()) != "track" {
                 return None;
             }
-            id.to_owned()
+            caps.get(2).map_or("", |m| m.as_str()).to_owned()
         } else {
             identifier.to_owned()
         };
 
-        let token = match self.client.token_tracker.get_oauth_token().await {
-            Some(t) => t,
-            None => {
-                warn!("Tidal playback requires an OAuth login");
-                return None;
-            }
-        };
-
-        let quality = &self.client.quality;
-        let url = format!(
-            "https://api.tidal.com/v1/tracks/{}/playbackinfo?audioquality={}&playbackmode=STREAM&assetpresentation=FULL&countryCode={}",
-            id, quality, self.client.country_code
-        );
-
-        debug!("Tidal: Resolving playback info for {}", id);
-
-        let resp = match self
-            .client
-            .inner
-            .get(&url)
-            .header("Authorization", format!("Bearer {token}"))
-            .header("User-Agent", "TIDAL/3704 CFNetwork/1220.1 Darwin/20.3.0")
-            .send()
-            .await
-        {
-            Ok(r) => r,
-            Err(e) => {
-                warn!("Tidal: Failed to fetch playback info: {}", e);
-                return None;
-            }
-        };
-
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let body = resp.text().await.unwrap_or_default();
-            warn!("Tidal: Playback API returned {}: {}", status, body);
-            return None;
-        }
-
-        let info: PlaybackInfo = match resp.json().await {
-            Ok(i) => i,
-            Err(e) => {
-                warn!("Tidal: Failed to parse playback info: {}", e);
-                return None;
-            }
-        };
-
-        let decoded = match general_purpose::STANDARD.decode(&info.manifest) {
-            Ok(d) => d,
-            Err(e) => {
-                warn!("Tidal: Failed to decode manifest: {}", e);
-                return None;
-            }
-        };
-
-        let manifest: Manifest = match serde_json::from_slice(&decoded) {
-            Ok(m) => m,
-            Err(e) => {
-                warn!("Tidal: Failed to parse manifest JSON: {}", e);
-                return None;
-            }
-        };
-
-        let stream_url = match manifest.urls.first() {
-            Some(u) => u.clone(),
-            None => {
-                warn!("Tidal: No stream URL in manifest");
-                return None;
-            }
-        };
-
-        let mut kind = AudioFormat::from_url(&stream_url);
-        if kind == AudioFormat::Unknown {
-            if quality == "HI_RES_LOSSLESS" {
-                kind = AudioFormat::Flac;
-            } else if quality == "LOSSLESS" {
-                kind = AudioFormat::Mp4;
-            } else {
-                kind = AudioFormat::Aac;
-            }
-        }
+        let (stream_url, kind) = self.resolve_stream_url(&id).await?;
 
         Some(Box::new(TidalTrack {
             identifier: id,
             stream_url,
             kind,
-            client: self.client.clone(),
+            http_client: self.client.inner.clone(),
         }))
     }
 }

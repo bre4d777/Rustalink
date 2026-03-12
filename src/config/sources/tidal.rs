@@ -2,9 +2,12 @@ use serde::{Deserialize, Serialize};
 
 use super::HttpProxyConfig;
 use crate::config::sources::{
-    default_country_code, default_false, default_limit_20, default_limit_50, default_tidal_quality,
-    default_true,
+    default_country_code, default_limit_20, default_limit_50, default_tidal_quality, default_true,
 };
+
+fn default_hifi_qualities() -> Vec<String> {
+    vec!["LOSSLESS".to_string(), "HIGH".to_string(), "LOW".to_string()]
+}
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct TidalConfig {
@@ -12,11 +15,10 @@ pub struct TidalConfig {
     pub enabled: bool,
     #[serde(default = "default_country_code")]
     pub country_code: String,
-    #[serde(default = "default_tidal_quality")]
-    pub quality: String,
-    pub refresh_token: Option<String>,
-    #[serde(default = "default_false")]
-    pub get_oauth_token: bool,
+    #[serde(default)]
+    pub hifi_apis: Vec<String>,
+    #[serde(default = "default_hifi_qualities")]
+    pub hifi_qualities: Vec<String>,
     #[serde(default = "default_limit_50")]
     pub playlist_load_limit: usize,
     #[serde(default = "default_limit_50")]
@@ -31,9 +33,8 @@ impl Default for TidalConfig {
         Self {
             enabled: true,
             country_code: default_country_code(),
-            quality: default_tidal_quality(),
-            refresh_token: None,
-            get_oauth_token: false,
+            hifi_apis: vec![],
+            hifi_qualities: default_hifi_qualities(),
             playlist_load_limit: 50,
             album_load_limit: 50,
             artist_load_limit: 20,
