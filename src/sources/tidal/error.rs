@@ -2,10 +2,10 @@ use thiserror::Error;
 
 #[derive(Debug, Error)]
 pub enum TidalError {
-    #[error("API request failed: {0}")]
+    #[error("HTTP request failed: {0}")]
     Request(#[from] reqwest::Error),
 
-    #[error("API returned {status}: {body}")]
+    #[error("HiFi API returned {status}: {body}")]
     ApiError {
         status: reqwest::StatusCode,
         body: String,
@@ -14,19 +14,22 @@ pub enum TidalError {
     #[error("Failed to parse response: {0}")]
     Parse(#[from] serde_json::Error),
 
-    #[error("Base64 decode failed: {0}")]
+    #[error("Base64 decode error: {0}")]
     Base64(#[from] base64::DecodeError),
 
-    #[error("Authentication failed: {0}")]
-    Auth(String),
+    #[error("No HiFi API base URLs configured — add at least one URL to hifi_apis")]
+    NoApisConfigured,
 
-    #[error("No token available")]
-    NoToken,
+    #[error("All HiFi API base URLs failed for this request")]
+    AllApisFailed,
 
-    #[error("No stream URL in manifest")]
+    #[error("Unsupported manifest type: {0} (DASH is not directly streamable)")]
+    UnsupportedManifest(String),
+
+    #[error("No stream URL found in manifest")]
     NoStreamUrl,
 
-    #[error("Other error: {0}")]
+    #[error("{0}")]
     Other(String),
 }
 
