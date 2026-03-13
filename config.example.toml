@@ -17,7 +17,7 @@ tape = { tape_stop = true, tape_stop_duration_ms = 500, curve = "sinusoidal" } #
 
 [player.mirrors]
 # List of mirror provider patterns. %ISRC% or %QUERY%
-providers = ["ytsearch:%ISRC%", "ytsearch:%QUERY%", "scsearch:%QUERY%"]
+providers = ["tdsearch:%ISRC%","dzsearch:%ISRC%","jssearch:%QUERY%","amksearch:%QUERY%","gnsearch%QUERY%","dzsearch:%QUERY%","ytsearch:%ISRC%", "ytsearch:%QUERY%", "scsearch:%QUERY%"]
 
 [player.mirrors.best_match]
 # Enable weighted scoring to find the best-matching candidate.
@@ -121,12 +121,11 @@ enabled = false
 [sources.tidal]
 enabled = false
 country_code = "US"
-quality = "LOSSLESS" # HI_RES_LOSSLESS | LOSSLESS | HIGH | LOW
+hifi_apis = ["http://localhost:8000"]          # at least one HiFi API URL required
+hifi_qualities = ["LOSSLESS", "HIGH", "LOW"]   
 playlist_load_limit = 50
 album_load_limit = 50
 artist_load_limit = 20
-get_oauth_token = false
-# refresh_token = "your-refresh-token" # required for playback 
 # proxy = { url = "http://proxy:8080", username = "user", password = "pass" }
 
 [sources.soundcloud]
