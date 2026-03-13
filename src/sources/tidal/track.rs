@@ -34,7 +34,8 @@ impl PlayableTrack for TidalTrack {
             debug!("TidalTrack: starting playback for {}", identifier);
 
             let setup_res = tokio::task::spawn_blocking(move || {
-                match HttpSource::new(http_client, &stream_url) {
+                let client_clone = (*tidal.inner).clone();
+                match HttpSource::new(client_clone, &stream_url) {
                     Ok(reader) => AudioProcessor::new(
                         Box::new(reader),
                         Some(kind),
@@ -59,13 +60,19 @@ impl PlayableTrack for TidalTrack {
                         .name(format!("tidal-decoder-{}", identifier))
                         .spawn(move || {
                             if let Err(e) = processor.run() {
-                                error!("TidalTrack: processor error for {}: {}", identifier, e);
+                                error!(
+                                    "TidalTrack audio processor error for {}: {}",
+                                    identifier, e
+                                );
                             }
                         })
                         .expect("failed to spawn tidal decoder thread");
                 }
                 Err(e) => {
-                    error!("TidalTrack: failed to init processor for {}: {}", identifier, e);
+                    error!(
+                        "TidalTrack failed to initialize processor for {}: {}",
+                        identifier, e
+                    );
                     let _ = err_tx.send(format!("Failed to initialize processor: {e}"));
                 }
             }
